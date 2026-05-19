@@ -5,7 +5,7 @@ Entry point — reads .env, starts bot.
 import asyncio
 import sys
 
-from .bot import build, _stop_hunt
+from .bot import build, _stop_hunt, wait_hunt_stopped
 from .config import get_bot_token, get_user_id
 
 
@@ -24,6 +24,7 @@ async def _run() -> None:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         await _stop_hunt(bot)
+        await wait_hunt_stopped()
         await bot.session.close()
 
 
