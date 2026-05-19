@@ -65,15 +65,18 @@ async def _fetch_live_regions(token: str) -> None:
     global _live_regions
     if _live_regions:
         return
+    c: RegRuClient | None = None
     try:
         c = RegRuClient(api_token=token)
         _live_regions = await c.discover_regions()
-        await c.close()
         for r in _live_regions:
             REGION_NAMES.setdefault(r, r)
         print(f"[bot] Live regions: {_live_regions}")
     except Exception as e:
         print(f"[bot] Region discovery failed: {e}")
+    finally:
+        if c is not None:
+            await c.close()
 
 
 # ───────────────────────── Settings meta ─────────────────────────
@@ -130,6 +133,7 @@ class HuntSelect(StatesGroup):
 @dataclass
 class _Hunt:
     active:  bool = False
+    stopping: bool = False
     workers: list[IPWorker]     = field(default_factory=list)
     tasks:   list[asyncio.Task] = field(default_factory=list)
     stats:   list[WorkerStats]  = field(default_factory=list)
@@ -145,6 +149,13 @@ class _Hunt:
 
 _hunt = _Hunt()
 _OWNER: int = 0
+
+def _hunt_busy() -> bool:
+    return (
+        _hunt.active
+        or _hunt.stopping
+        or (_hunt.supervisor is not None and not _hunt.supervisor.done())
+    )
 
 def _ok(ev) -> bool:
     return bool(ev.from_user and ev.from_user.id == _OWNER)
@@ -580,7 +591,7 @@ async def cb_acc_view(cb: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "acc:add")
 async def cb_add(cb: CallbackQuery, state: FSMContext) -> None:
     if not _ok(cb): return
-    if _hunt.active:
+    if _hunt_busy():
         await cb.answer("Нельзя во время охоты", show_alert=True); return
     await state.clear()
     await state.set_state(AddAccount.name)
@@ -878,7 +889,7 @@ async def cb_del(cb: CallbackQuery, state: FSMContext) -> None:
         accs = await storage.get_accounts()
         await _cb_edit(cb, txt_accs(accs), reply_markup=kb_accounts(accs, _hunt.active))
         await cb.answer("🗑 OK"); return
-    if _hunt.active:
+    if _hunt_busy():
         await cb.answer("Нельзя во время охоты", show_alert=True); return
     await _cb_edit(cb,
         f"🗑 Удалить <b>{accs[idx]['name']}</b>?",
@@ -1230,7 +1241,7 @@ async def _render_hunt_select(cb: CallbackQuery, state: FSMContext, sel: list[st
 @router.callback_query(F.data == "hunt:start")
 async def cb_hunt_start(cb: CallbackQuery, state: FSMContext) -> None:
     if not _ok(cb): return
-    if _hunt.active:
+    if _hunt_busy():
         await cb.answer("Уже идёт", show_alert=True); return
     accs = await storage.get_accounts()
     if not accs:
@@ -1271,7 +1282,7 @@ async def cb_hselnone(cb: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "hunt:go")
 async def cb_hunt_go(cb: CallbackQuery, state: FSMContext) -> None:
     if not _ok(cb): return
-    if _hunt.active:
+    if _hunt_busy():
         await cb.answer("Уже идёт", show_alert=True); return
     data = await state.get_data()
     sel_names = set(data.get("selected", []))
@@ -1295,6 +1306,7 @@ async def cb_hunt_go(cb: CallbackQuery, state: FSMContext) -> None:
     _hunt.update_interval = upd
     _hunt.show_errors     = bool(s.get("show_errors", False))
     _hunt.active          = True
+    _hunt.stopping        = False
 
     bot = cb.message.bot
 
@@ -1440,6 +1452,7 @@ async def cb_hunt_stop(cb: CallbackQuery) -> None:
 async def _stop_hunt(bot: Optional[Bot] = None) -> None:
     """Signal workers to stop.  Cleanup happens in supervisor."""
     _hunt.active = False
+    _hunt.stopping = True
     for w in _hunt.workers:
         w.stop()
     if _hunt.updater:
@@ -1449,6 +1462,14 @@ async def _stop_hunt(bot: Optional[Bot] = None) -> None:
     if bot and _hunt.chat_id and _hunt.msg_id:
         await _safe_edit(bot, _hunt.chat_id, _hunt.msg_id,
                          txt_card(_hunt.stats, _hunt.target_rpm, _hunt.show_errors))
+
+async def wait_hunt_stopped(timeout: float = 30.0) -> None:
+    sup = _hunt.supervisor
+    if sup and not sup.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(sup), timeout=timeout)
+        except asyncio.TimeoutError:
+            print("[bot] shutdown cleanup is still running")
 
 async def _updater(bot: Bot) -> None:
     while _hunt.active:
@@ -1489,11 +1510,14 @@ async def _quota_guard_loop() -> None:
         pass
 
 async def _supervisor(bot: Bot) -> None:
+    clients = list(_hunt.clients)
+    stats = list(_hunt.stats)
     try:
         await asyncio.gather(*_hunt.tasks, return_exceptions=True)
     finally:
         was = _hunt.active
         _hunt.active = False
+        _hunt.stopping = True
         if _hunt.updater:
             _hunt.updater.cancel()
         if _hunt.quota_guard:
@@ -1501,7 +1525,7 @@ async def _supervisor(bot: Bot) -> None:
 
         # IDs to keep: reglets where the target IP was found
         keep_by_key: dict[tuple[str, str], set[str]] = {}
-        for c, st in zip(_hunt.clients, _hunt.stats):
+        for c, st in zip(clients, stats):
             if st.found and st.found_id:
                 k = (c._token, c._region)   # type: ignore[attr-defined]
                 keep_by_key.setdefault(k, set()).add(st.found_id)
@@ -1510,7 +1534,7 @@ async def _supervisor(bot: Bot) -> None:
         # killing ALL hunt-* except "found" ones.  Idempotent + waits
         # for full disappearance.
         seen: set[tuple[str, str]] = set()
-        for c in _hunt.clients:
+        for c in clients:
             k = (c._token, c._region)   # type: ignore[attr-defined]
             if k in seen:
                 continue
@@ -1525,9 +1549,15 @@ async def _supervisor(bot: Bot) -> None:
         if was and _hunt.chat_id and _hunt.msg_id:
             await _safe_edit(bot, _hunt.chat_id, _hunt.msg_id,
                              txt_card(_hunt.stats, _hunt.target_rpm, _hunt.show_errors))
-        for c in _hunt.clients:
+        for c in clients:
             try: await c.close()
             except Exception: pass
+        if _hunt.clients == clients:
+            _hunt.clients.clear()
+            _hunt.workers.clear()
+            _hunt.tasks.clear()
+            _hunt.stats.clear()
+        _hunt.stopping = False
 
 
 # ───────────────────────── Fallback + build ─────────────────────────
